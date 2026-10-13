@@ -74,9 +74,10 @@ final class Config
     public static function allowedOrigins(): array
     {
         $default = 'https://payrollandbenefits-frontend.vercel.app,http://localhost:5173';
+        $configured = trim((string) env('FRONTEND_ORIGIN', ''));
         return array_values(array_filter(array_map(
             static fn ($o) => rtrim(trim($o), '/'),
-            explode(',', (string) env('FRONTEND_ORIGIN', $default))
+            explode(',', $configured !== '' ? $configured : $default)
         ), static fn ($o) => $o !== ''));
     }
 
