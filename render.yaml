@@ -1,0 +1,47 @@
+# Render Blueprint — Laravel API (PHP port) shipped as a Docker image.
+# Same secret names as the legacy blueprint thanks to the DB_* -> SUPABASE_DB_*
+# fallback in config/database.php, so an existing service can switch over
+# without re-entering secrets.
+services:
+  - type: web
+    name: payroll-api
+    env: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    region: singapore          # nearest Render region to the Mumbai (ap-south-1) Supabase pooler
+    healthCheckPath: /api/health
+    envVars:
+      - key: APP_ENV
+        value: production
+      - key: APP_DEBUG
+        value: "0"
+      - key: APP_KEY
+        sync: false            # paste `php artisan key:generate --show` output (auto-generated at boot if left unset)
+      - key: FRONTEND_ORIGIN
+        sync: false            # your Vercel URL(s), comma-separated
+      - key: REGISTRATION_CODE
+        sync: false            # gate code for the Register page
+      - key: SUPABASE_DB_HOST
+        sync: false            # e.g. aws-0-ap-south-1.pooler.supabase.com (SESSION pooler, not 6543)
+      - key: SUPABASE_DB_PORT
+        value: "5432"
+      - key: SUPABASE_DB_NAME
+        value: postgres
+      - key: SUPABASE_DB_USER
+        sync: false            # e.g. postgres.<project-ref>
+      - key: SUPABASE_DB_PASSWORD
+        sync: false
+      - key: SUPABASE_DB_SSLMODE
+        value: require
+      - key: SUPABASE_URL
+        sync: false            # https://<ref>.supabase.co — needed for GoTrue OTP login + Storage
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false            # avatar/receipt uploads to Supabase Storage
+      - key: APP_SECRET
+        sync: false            # HS256 app-JWT signing secret; keep the value the frontend logins already use
+      - key: TABSCANNER_API_KEY
+        sync: false            # receipt OCR (free tier 200/month)
+      - key: GOOGLE_SA_JSON
+        sync: false            # optional Google Vision OCR fallback (inline JSON)
+      - key: GOOGLE_APPLICATION_CREDENTIALS
+        sync: false            # optional Render secret-file path for the same JSON
