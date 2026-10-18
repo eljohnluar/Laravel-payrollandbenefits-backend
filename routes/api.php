@@ -829,6 +829,8 @@ Route::get('/integration/capabilities', static function (): \Illuminate\Http\Jso
         ],
         'provides' => [
             ['module' => 'Financial Management', 'endpoint' => 'GET /api/integration/journal/{runId}', 'scope' => 'finance:read'],
+            ['module' => 'Recruitment & Onboarding (ESS)', 'endpoint' => 'GET /api/integration/payslips/{employeeCode}', 'scope' => 'payroll:read'],
+            ['module' => 'Recruitment & Onboarding (ESS)', 'endpoint' => 'POST /api/integration/payslips/batch', 'scope' => 'payroll:read'],
             ['module' => 'All modules', 'events' => ['payroll.submitted', 'payroll.approved', 'payroll.rejected', 'payroll.paid'], 'delivery' => 'webhook (HMAC-SHA256 signed)'],
         ],
     ]);
@@ -1009,6 +1011,96 @@ Route::get('/integration/journal/{runId}', static function (string $runId) use (
         'journal_entries' => $gl->fetchAll(),
         'disbursements' => $disb->fetchAll(),
     ]);
+});
+
+/* Employee-scoped payslip export for external ESS portals (scope payroll:read).
+   Only post-submission runs are exposed; numeric fields stay strings, matching
+   the /api/me/payroll-summary field names HR systems map against. */
+$payslipsFor = static function (string $code, ?string $periodStart, int $limit): ?array {
+    $pdo = Database::pdo();
+    $emp = $pdo->prepare(
+        "SELECT id, code, first_name, middle_name, last_name, department, position, status, basic_salary
+           FROM employees WHERE code = ? AND is_archived = FALSE"
+    );
+    $emp->execute([$code]);
+    $e = $emp->fetch();
+    if ($e === false) {
+        return null;
+    }
+    $sql =
+        "SELECT r.period, r.period_start, r.period_end, r.status AS run_status,
+                i.days_worked, i.ot_hours, i.basic_pay, i.overtime_pay, i.night_differential,
+                i.holiday_pay, i.allowances, i.claims_amount, i.incentives, i.gross_pay,
+                i.sss_ee, i.philhealth_ee, i.pagibig_ee, i.withholding_tax,
+                i.loans_deduction, i.unpaid_leave_deduction, i.hmo_deduction, i.attendance_deduction,
+                i.total_deductions, i.net_pay, i.pay_date, i.statutory_basis
+           FROM payroll_items i
+           JOIN payroll_runs r ON r.id = i.payroll_run_id
+          WHERE i.employee_id = ? AND i.is_included = TRUE AND i.is_archived = FALSE
+            AND r.status IN ('Pending Finance Approval', 'Approved', 'Paid', 'Closed')";
+    if ($periodStart !== null) {
+        $sql .= ' AND r.period_start >= ?';
+    }
+    $sql .= ' ORDER BY r.period_start DESC LIMIT ' . $limit;
+    $stmt = $pdo->prepare($sql);
+    $stmt->execute($periodStart !== null ? [$e['id'], $periodStart] : [$e['id']]);
+    return [
+        'employee' => [
+            'id'           => $e['id'],
+            'code'         => $e['code'],
+            'name'         => trim($e['first_name'] . ' ' . ($e['middle_name'] ?? '') . ' ' . $e['last_name']),
+            'department'   => $e['department'],
+            'position'     => $e['position'],
+            'status'       => $e['status'],
+            'basic_salary' => $e['basic_salary'],
+        ],
+        'payslips' => $stmt->fetchAll(),
+    ];
+};
+
+Route::get('/integration/payslips/{employeeCode}', static function (string $employeeCode, Request $request) use ($integration, $payslipsFor): \Illuminate\Http\JsonResponse {
+    $integration()->requireScope('payroll:read');
+    $code = trim($employeeCode);
+    if ($code === '') {
+        Http::error('employeeCode is required.', 422);
+    }
+    $query = $request->query();
+    $limit = min(max((int) ($query['limit'] ?? 24), 1), 24);
+    $periodStart = trim((string) ($query['period_start'] ?? '')) ?: null;
+    $payload = $payslipsFor($code, $periodStart, $limit);
+    if ($payload === null) {
+        Http::error('Unknown employee code ' . $code . '.', 404);
+    }
+    return Http::json($payload);
+});
+
+Route::post('/integration/payslips/batch', static function () use ($integration, $payslipsFor): \Illuminate\Http\JsonResponse {
+    $integration()->requireScope('payroll:read');
+    $body = Http::body();
+    $codes = $body['codes'] ?? null;
+    if (!is_array($codes) || $codes === []) {
+        Http::error('Body must be {"codes": [ "E001", ... ]} with at least one code.', 422);
+    }
+    if (count($codes) > 100) {
+        Http::error('A batch supports at most 100 codes per call.', 422);
+    }
+    $limit = min(max((int) ($body['limit'] ?? 24), 1), 24);
+    $periodStart = trim((string) ($body['period_start'] ?? '')) ?: null;
+    $employees = [];
+    $notFound = [];
+    foreach ($codes as $c) {
+        $code = is_string($c) ? trim($c) : '';
+        if ($code === '') {
+            Http::error('Every code must be a non-empty string.', 422);
+        }
+        $payload = $payslipsFor($code, $periodStart, $limit);
+        if ($payload === null) {
+            $notFound[] = $code;
+        } else {
+            $employees[] = $payload;
+        }
+    }
+    return Http::json(['ok' => true, 'employees' => $employees, 'not_found' => $notFound]);
 });
 
 Route::get('/integration/keys', static function (): \Illuminate\Http\JsonResponse {
