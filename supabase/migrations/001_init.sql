@@ -377,7 +377,7 @@ CREATE TABLE IF NOT EXISTS public.performance_ratings (
   id          INT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
   employee_id VARCHAR(20) NOT NULL REFERENCES public.employees(id) ON DELETE CASCADE,
   review_date DATE NOT NULL,
-  rating      VARCHAR(20),
+  rating      VARCHAR(100),
   bonus_amount NUMERIC(12,2) NOT NULL DEFAULT 0
 );
 
