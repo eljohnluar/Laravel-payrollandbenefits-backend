@@ -966,7 +966,7 @@ Route::post('/integration/leave', static function () use ($integration): \Illumi
             $eid, $type, $start,
             trim((string) ($r['end_date'] ?? '')) ?: $start,
             (float) ($r['days'] ?? 0),
-            (bool) ($r['is_paid'] ?? true),
+            (int) filter_var($r['is_paid'] ?? true, FILTER_VALIDATE_BOOL),
             $status,
         ]);
         $saved++;
