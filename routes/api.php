@@ -825,7 +825,8 @@ Route::get('/integration/capabilities', static function (): \Illuminate\Http\Jso
             ['module' => 'Core HR', 'endpoint' => 'POST /api/integration/employees', 'scope' => 'core-hr:write'],
             ['module' => 'Workforce Management', 'endpoint' => 'POST /api/integration/attendance', 'scope' => 'workforce:write'],
             ['module' => 'Workforce Management', 'endpoint' => 'POST /api/integration/leave', 'scope' => 'workforce:write'],
-            ['module' => 'Workforce Management', 'endpoint' => 'POST /api/integration/performance', 'scope' => 'performance:write'],
+            ['module' => 'Workforce Management', 'endpoint' => 'POST /api/integration/performance', 'scope' => 'performance:write', 'dedupe' => 'optional evaluation_id — duplicates are skipped'],
+            ['module' => 'Performance & Development', 'endpoint' => 'POST /api/integration/recognition', 'scope' => 'performance:write', 'dedupe' => 'optional recognition_id — duplicates are skipped'],
         ],
         'provides' => [
             ['module' => 'Financial Management', 'endpoint' => 'GET /api/integration/journal/{runId}', 'scope' => 'finance:read'],
@@ -877,7 +878,7 @@ Route::post('/integration/employees', static function () use ($integration): \Il
             $first, $str($e, 'middle_name'), $last, $str($e, 'suffix'), $str($e, 'email'),
             $str($e, 'mobile'), $str($e, 'birth_date'), $str($e, 'gender'),
             $str($e, 'department'), $str($e, 'position'), $str($e, 'employment_type'), $str($e, 'hire_date'),
-            $str($e, 'basic_salary') !== null ? (float) $str($e, 'basic_salary') : null, $str($e, 'status'),
+            ($bs = $str($e, 'basic_salary')) !== null && (float) $bs > 0 ? (float) $bs : null, $str($e, 'status'),
             $str($e, 'sss'), $str($e, 'philhealth'), $str($e, 'pagibig'), $str($e, 'tin'),
             $str($e, 'ewallet_provider'), $str($e, 'ewallet_account'), $str($e, 'ewallet_name'),
         ];
@@ -886,6 +887,9 @@ Route::post('/integration/employees', static function () use ($integration): \Il
         if ($id !== false) {
             $upd->execute([...$vals, $id]);
         } else {
+            if ($vals[12] === null) {
+                $vals[12] = 0; // new records need a salary value; 0 until Core HR supplies the real one
+            }
             $ins->execute(['hris-' . strtolower($code), $code, ...$vals]);
             $created++;
         }
@@ -978,19 +982,78 @@ Route::post('/integration/performance', static function () use ($integration): \
         Http::error('Body must be {"ratings": [ ... ]} with at least one record.', 422);
     }
     $pdo = Database::pdo();
-    $stmt = $pdo->prepare('INSERT INTO performance_ratings (employee_id, review_date, rating, bonus_amount) VALUES (?, ?, ?, ?)');
+    $dup  = $pdo->prepare('SELECT 1 FROM performance_ratings WHERE evaluation_ref = ?');
+    $check = $pdo->prepare('SELECT 1 FROM employees WHERE id = ?');
+    $stmt = $pdo->prepare('INSERT INTO performance_ratings (employee_id, review_date, rating, bonus_amount, evaluation_ref) VALUES (?, ?, ?, ?, ?)');
     $saved = 0;
+    $skipped = 0;
     foreach ($rows as $r) {
         $eid = trim((string) (is_array($r) ? $r['employee_id'] ?? '' : ''));
         $date = trim((string) (is_array($r) ? $r['review_date'] ?? '' : ''));
         if ($eid === '' || $date === '') {
             Http::error('Each rating needs employee_id and review_date.', 422);
         }
-        $stmt->execute([$eid, $date, trim((string) ($r['rating'] ?? '')) ?: null, (float) ($r['bonus_amount'] ?? 0)]);
+        $evalRef = isset($r['evaluation_id']) && (string) $r['evaluation_id'] !== '' ? (int) $r['evaluation_id'] : null;
+        if ($evalRef !== null) {
+            $dup->execute([$evalRef]);
+            if ($dup->fetchColumn() !== false) {
+                $skipped++;
+                continue;
+            }
+        }
+        $check->execute([$eid]);
+        if ($check->fetchColumn() === false) {
+            Http::error('Unknown employee_id ' . $eid . '. Sync Core HR employees first.', 422);
+        }
+        $stmt->execute([$eid, $date, trim((string) ($r['rating'] ?? '')) ?: null, (float) ($r['bonus_amount'] ?? 0), $evalRef]);
         $saved++;
     }
-    AuditService::log('Performance Sync', 'Integration', null, ['ratings' => $saved]);
-    return Http::json(['ok' => true, 'saved' => $saved]);
+    AuditService::log('Performance Sync', 'Integration', null, ['ratings' => $saved, 'skipped' => $skipped]);
+    return Http::json(['ok' => true, 'saved' => $saved, 'skipped_duplicates' => $skipped]);
+});
+
+Route::post('/integration/recognition', static function () use ($integration): \Illuminate\Http\JsonResponse {
+    $integration()->requireScope('performance:write');
+    $rows = Http::body()['awards'] ?? null;
+    if (!is_array($rows) || $rows === []) {
+        Http::error('Body must be {"awards": [ ... ]} with at least one record.', 422);
+    }
+    $pdo = Database::pdo();
+    $dup  = $pdo->prepare('SELECT 1 FROM recognition_awards WHERE recognition_ref = ?');
+    $check = $pdo->prepare('SELECT 1 FROM employees WHERE id = ?');
+    $stmt = $pdo->prepare('INSERT INTO recognition_awards (employee_id, award_date, award_name, bonus_amount, recognition_ref, tier, points) VALUES (?, ?, ?, ?, ?, ?, ?)');
+    $saved = 0;
+    $skipped = 0;
+    foreach ($rows as $a) {
+        $eid = trim((string) (is_array($a) ? $a['employee_id'] ?? '' : ''));
+        $award = trim((string) (is_array($a) ? $a['award'] ?? ($a['award_name'] ?? '') : ''));
+        $date = trim((string) (is_array($a) ? ($a['approved_at'] ?? $a['award_date'] ?? '') : ''));
+        $date = substr($date, 0, 10);
+        if ($eid === '' || $award === '' || $date === '') {
+            Http::error('Each award needs employee_id, award and approved_at (or award_date).', 422);
+        }
+        $recRef = isset($a['recognition_id']) && (string) $a['recognition_id'] !== '' ? (int) $a['recognition_id'] : null;
+        if ($recRef !== null) {
+            $dup->execute([$recRef]);
+            if ($dup->fetchColumn() !== false) {
+                $skipped++;
+                continue;
+            }
+        }
+        $check->execute([$eid]);
+        if ($check->fetchColumn() === false) {
+            Http::error('Unknown employee_id ' . $eid . '. Sync Core HR employees first.', 422);
+        }
+        $stmt->execute([
+            $eid, $date, $award,
+            (float) ($a['bonus_amount'] ?? 0), $recRef,
+            trim((string) ($a['tier'] ?? '')) ?: null,
+            ($a['points'] ?? null) !== null && $a['points'] !== '' ? (float) $a['points'] : null,
+        ]);
+        $saved++;
+    }
+    AuditService::log('Recognition Sync', 'Integration', null, ['awards' => $saved, 'skipped' => $skipped]);
+    return Http::json(['ok' => true, 'saved' => $saved, 'skipped_duplicates' => $skipped]);
 });
 
 Route::get('/integration/journal/{runId}', static function (string $runId) use ($integration): \Illuminate\Http\JsonResponse {
