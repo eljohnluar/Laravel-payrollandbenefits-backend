@@ -827,6 +827,7 @@ Route::get('/integration/capabilities', static function (): \Illuminate\Http\Jso
             ['module' => 'Workforce Management', 'endpoint' => 'POST /api/integration/leave', 'scope' => 'workforce:write'],
             ['module' => 'Workforce Management', 'endpoint' => 'POST /api/integration/performance', 'scope' => 'performance:write', 'dedupe' => 'optional evaluation_id — duplicates are skipped'],
             ['module' => 'Performance & Development', 'endpoint' => 'POST /api/integration/recognition', 'scope' => 'performance:write', 'dedupe' => 'optional recognition_id — duplicates are skipped'],
+            ['module' => 'Performance & Development', 'endpoint' => 'POST /api/integration/promotions', 'scope' => 'performance:write', 'dedupe' => 'optional promotion_id — duplicates are skipped'],
         ],
         'provides' => [
             ['module' => 'Financial Management', 'endpoint' => 'GET /api/integration/journal/{runId}', 'scope' => 'finance:read'],
@@ -1053,6 +1054,53 @@ Route::post('/integration/recognition', static function () use ($integration): \
         $saved++;
     }
     AuditService::log('Recognition Sync', 'Integration', null, ['awards' => $saved, 'skipped' => $skipped]);
+    return Http::json(['ok' => true, 'saved' => $saved, 'skipped_duplicates' => $skipped]);
+});
+
+Route::post('/integration/promotions', static function () use ($integration): \Illuminate\Http\JsonResponse {
+    $integration()->requireScope('performance:write');
+    $rows = Http::body()['promotions'] ?? null;
+    if (!is_array($rows) || $rows === []) {
+        Http::error('Body must be {"promotions": [ ... ]} with at least one record.', 422);
+    }
+    $pdo = Database::pdo();
+    $dup  = $pdo->prepare('SELECT 1 FROM promotion_records WHERE promotion_ref = ?');
+    $check = $pdo->prepare('SELECT 1 FROM employees WHERE id = ?');
+    $stmt = $pdo->prepare('INSERT INTO promotion_records (employee_id, from_position, to_position, readiness, effective_date, approved_at, promotion_ref) VALUES (?, ?, ?, ?, ?, ?, ?)');
+    $saved = 0;
+    $skipped = 0;
+    foreach ($rows as $pr) {
+        $eid = trim((string) (is_array($pr) ? $pr['employee_id'] ?? '' : ''));
+        $to  = trim((string) (is_array($pr) ? $pr['to_position'] ?? '' : ''));
+        $approvedAt = substr(trim((string) (is_array($pr) ? ($pr['approved_at'] ?? '') : '')), 0, 10);
+        if ($eid === '' || $to === '' || $approvedAt === '') {
+            Http::error('Each promotion needs employee_id, to_position and approved_at (YYYY-MM-DD).', 422);
+        }
+        $ref = isset($pr['promotion_id']) && (string) $pr['promotion_id'] !== '' ? (int) $pr['promotion_id'] : null;
+        if ($ref !== null) {
+            $dup->execute([$ref]);
+            if ($dup->fetchColumn() !== false) {
+                $skipped++;
+                continue;
+            }
+        }
+        $check->execute([$eid]);
+        if ($check->fetchColumn() === false) {
+            Http::error('Unknown employee_id ' . $eid . '. Sync Core HR employees first.', 422);
+        }
+        $eff = trim((string) ($pr['effective_date'] ?? ''));
+        $stmt->execute([
+            $eid,
+            trim((string) ($pr['from_position'] ?? '')) ?: null,
+            $to,
+            trim((string) ($pr['readiness'] ?? '')) ?: null,
+            $eff !== '' ? substr($eff, 0, 10) : null,
+            $approvedAt,
+            $ref,
+        ]);
+        $saved++;
+    }
+    AuditService::log('Promotion Sync', 'Integration', null, ['promotions' => $saved, 'skipped' => $skipped]);
     return Http::json(['ok' => true, 'saved' => $saved, 'skipped_duplicates' => $skipped]);
 });
 
