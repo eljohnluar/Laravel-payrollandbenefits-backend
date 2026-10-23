@@ -1214,6 +1214,76 @@ Route::post('/integration/payslips/batch', static function () use ($integration,
     return Http::json(['ok' => true, 'employees' => $employees, 'not_found' => $notFound]);
 });
 
+Route::get('/integration/status', static function (): \Illuminate\Http\JsonResponse {
+    Auth::requireHrAdmin();
+    $pdo = Database::pdo();
+    $count = static function (string $sql, array $args = []) use ($pdo): int {
+        $st = $pdo->prepare($sql);
+        $st->execute($args);
+        return (int) $st->fetchColumn();
+    };
+    $lastAt = static function (array $actions) use ($pdo): ?string {
+        $in = implode(',', array_fill(0, count($actions), '?'));
+        $st = $pdo->prepare("SELECT MAX(created_at) FROM audit_log WHERE action IN ($in)");
+        $st->execute($actions);
+        $v = $st->fetchColumn();
+        return ($v === null || $v === false) ? null : (string) $v;
+    };
+    $keysFor = static function (string $prefix) use ($pdo): array {
+        $st = $pdo->prepare('SELECT name, scopes, is_active, last_used_at FROM integration_keys WHERE name LIKE ? ORDER BY id');
+        $st->execute([$prefix . '%']);
+        return $st->fetchAll();
+    };
+
+    $partners = [
+        [
+            'key' => 'hr1', 'system' => 'HR1', 'name' => 'Core HR & Onboarding (Recruitment)',
+            'direction' => 'Two-way',
+            'endpoints' => [
+                ['method' => 'POST', 'path' => '/api/integration/employees', 'purpose' => 'Push employee master + compensation into HR4', 'scope' => 'core-hr:write'],
+                ['method' => 'GET', 'path' => '/api/integration/payslips/{code}', 'purpose' => 'Serve one employee\'s payslips back to ESS', 'scope' => 'payroll:read'],
+                ['method' => 'POST', 'path' => '/api/integration/payslips/batch', 'purpose' => 'Serve payslips for up to 100 codes', 'scope' => 'payroll:read'],
+            ],
+            'metrics' => [
+                ['label' => 'Employees synced', 'value' => $count("SELECT COUNT(*) FROM employees WHERE id LIKE 'hris-%' AND is_archived = FALSE")],
+                ['label' => 'Last push', 'value' => $lastAt(['Core HR Sync'])],
+            ],
+            'keys' => $keysFor('hr1'),
+        ],
+        [
+            'key' => 'hr2', 'system' => 'HR2', 'name' => 'Workforce Management',
+            'direction' => 'Inbound',
+            'endpoints' => [
+                ['method' => 'POST', 'path' => '/api/integration/attendance', 'purpose' => 'Push daily attendance & overtime logs', 'scope' => 'workforce:write'],
+                ['method' => 'POST', 'path' => '/api/integration/leave', 'purpose' => 'Push leave requests', 'scope' => 'workforce:write'],
+            ],
+            'metrics' => [
+                ['label' => 'Attendance rows', 'value' => $count('SELECT COUNT(*) FROM attendance_logs')],
+                ['label' => 'Leave requests', 'value' => $count('SELECT COUNT(*) FROM leave_requests')],
+                ['label' => 'Last push', 'value' => $lastAt(['Workforce Sync', 'Workforce Leave Sync'])],
+            ],
+            'keys' => $keysFor('hr2'),
+        ],
+        [
+            'key' => 'hr3', 'system' => 'HR3', 'name' => 'Performance & Development',
+            'direction' => 'Inbound',
+            'endpoints' => [
+                ['method' => 'POST', 'path' => '/api/integration/performance', 'purpose' => 'Push approved performance ratings', 'scope' => 'performance:write'],
+                ['method' => 'POST', 'path' => '/api/integration/recognition', 'purpose' => 'Push recognition awards', 'scope' => 'performance:write'],
+                ['method' => 'POST', 'path' => '/api/integration/promotions', 'purpose' => 'Push succession-plan promotions', 'scope' => 'performance:write'],
+            ],
+            'metrics' => [
+                ['label' => 'Evaluations', 'value' => $count('SELECT COUNT(*) FROM performance_ratings WHERE evaluation_ref IS NOT NULL')],
+                ['label' => 'Recognition awards', 'value' => $count('SELECT COUNT(*) FROM recognition_awards WHERE recognition_ref IS NOT NULL')],
+                ['label' => 'Promotions', 'value' => $count('SELECT COUNT(*) FROM promotion_records')],
+                ['label' => 'Last push', 'value' => $lastAt(['Performance Sync', 'Recognition Sync', 'Promotion Sync'])],
+            ],
+            'keys' => $keysFor('hr3'),
+        ],
+    ];
+    return Http::json(['partners' => $partners]);
+});
+
 Route::get('/integration/keys', static function (): \Illuminate\Http\JsonResponse {
     Auth::requireHrAdmin();
     return Http::json(['data' => Database::pdo()->query(
